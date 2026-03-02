@@ -30,12 +30,12 @@ def _camera_label(device_name: str, index: int) -> str:
     return f"Camera {index}"
 
 
-def _start_pipeline(serial: str) -> tuple[rs.pipeline, rs.align]:
+def _start_pipeline(serial: str, fps: int) -> tuple[rs.pipeline, rs.align]:
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_device(serial)
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, fps)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, fps)
     pipeline.start(config)
     return pipeline, rs.align(rs.stream.color)
 
@@ -46,18 +46,20 @@ def _discover_cameras() -> list[dict]:
     if not devices:
         return []
 
+    # Two cameras at 30 FPS can exceed USB bandwidth on some setups.
+    fps = 15 if len(devices) > 1 else 30
     cameras = []
     for i, dev in enumerate(devices, start=1):
         name = dev.get_info(rs.camera_info.name)
         serial = dev.get_info(rs.camera_info.serial_number)
         try:
-            pipeline, align = _start_pipeline(serial)
+            pipeline, align = _start_pipeline(serial, fps=fps)
         except RuntimeError as exc:
             print(f"Skipping {name} ({serial}): {exc}")
             continue
 
         label = _camera_label(name, i)
-        print(f"Started {label}: {name} ({serial})")
+        print(f"Started {label}: {name} ({serial}) at {fps} FPS")
         cameras.append(
             {
                 "name": name,
@@ -66,6 +68,8 @@ def _discover_cameras() -> list[dict]:
                 "pipeline": pipeline,
                 "align": align,
                 "save_idx": 0,
+                "last_frame": None,
+                "error_count": 0,
             }
         )
 
@@ -73,13 +77,23 @@ def _discover_cameras() -> list[dict]:
 
 
 def _render_camera_frame(cam: dict) -> np.ndarray | None:
-    frames = cam["pipeline"].wait_for_frames()
+    try:
+        frames = cam["pipeline"].poll_for_frames()
+    except RuntimeError as exc:
+        cam["error_count"] += 1
+        if cam["error_count"] in (1, 30):
+            print(f"{cam['label']} frame error: {exc}")
+        return cam["last_frame"]
+
+    if not frames:
+        return cam["last_frame"]
+
     aligned = cam["align"].process(frames)
 
     depth_frame = aligned.get_depth_frame()
     color_frame = aligned.get_color_frame()
     if not depth_frame or not color_frame:
-        return None
+        return cam["last_frame"]
 
     depth_image = np.asanyarray(depth_frame.get_data())
     color_image = np.asanyarray(color_frame.get_data())
@@ -91,7 +105,10 @@ def _render_camera_frame(cam: dict) -> np.ndarray | None:
     color_image = cv2.rotate(color_image, cv2.ROTATE_90_CLOCKWISE)
     depth_colormap = cv2.rotate(depth_colormap, cv2.ROTATE_90_CLOCKWISE)
 
-    return np.hstack((color_image, depth_colormap))
+    composed = np.hstack((color_image, depth_colormap))
+    cam["last_frame"] = composed
+    cam["error_count"] = 0
+    return composed
 
 
 def _stop_cameras(cameras: list[dict]) -> None:
@@ -110,12 +127,12 @@ def main() -> int:
         print(f"Missing script: {gamepad_demo}")
         return 1
 
-    print("Starting gamepad teleop...")
-    teleop_proc = subprocess.Popen([sys.executable, str(gamepad_demo)])
-
     cameras = _discover_cameras()
     if not cameras:
-        print("No RealSense cameras found. Teleop is still running.")
+        print("No RealSense cameras found.")
+
+    print("Starting gamepad teleop...")
+    teleop_proc = subprocess.Popen([sys.executable, str(gamepad_demo)])
 
     try:
         print("Press 'q' in a camera window to quit, 's' to save current frames.")
@@ -137,7 +154,7 @@ def main() -> int:
                 break
             if key == ord("s"):
                 for cam in cameras:
-                    frame = _render_camera_frame(cam)
+                    frame = cam["last_frame"]
                     if frame is None:
                         continue
                     out = f"{cam['label'].lower().replace(' ', '_')}_{cam['save_idx']}.png"
