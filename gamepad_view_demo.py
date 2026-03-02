@@ -12,20 +12,14 @@ Press 'q' in the camera window to quit.
 
 from __future__ import annotations
 
-import queue
 import subprocess
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-
-TARGET_CAMERA_FPS = 30
-FALLBACK_CAMERA_FPS = 15
-RECORD_CODEC = "MJPG"
 
 
 def _camera_label(device_name: str, index: int) -> str:
@@ -52,32 +46,26 @@ def _discover_cameras() -> list[dict]:
     if not devices:
         return []
 
+    # Two cameras at 30 FPS can exceed USB bandwidth on some setups.
+    fps = 15 if len(devices) > 1 else 30
     cameras = []
     for i, dev in enumerate(devices, start=1):
         name = dev.get_info(rs.camera_info.name)
         serial = dev.get_info(rs.camera_info.serial_number)
-
-        used_fps = TARGET_CAMERA_FPS
         try:
-            pipeline = _start_pipeline(serial, fps=used_fps)
+            pipeline = _start_pipeline(serial, fps=fps)
         except RuntimeError as exc:
-            print(f"{name} ({serial}) failed at {used_fps} FPS: {exc}")
-            try:
-                used_fps = FALLBACK_CAMERA_FPS
-                pipeline = _start_pipeline(serial, fps=used_fps)
-            except RuntimeError as exc2:
-                print(f"Skipping {name} ({serial}): {exc2}")
-                continue
+            print(f"Skipping {name} ({serial}): {exc}")
+            continue
 
         label = _camera_label(name, i)
-        print(f"Started {label}: {name} ({serial}) at {used_fps} FPS")
+        print(f"Started {label}: {name} ({serial}) at {fps} FPS")
         cameras.append(
             {
                 "name": name,
                 "serial": serial,
                 "label": label,
                 "pipeline": pipeline,
-                "fps": used_fps,
                 "save_idx": 0,
                 "last_frame": None,
                 "error_count": 0,
@@ -145,10 +133,9 @@ def _tile_frames(items: list[tuple[dict, np.ndarray]]) -> tuple[np.ndarray | Non
 def _draw_wrist_info_panel(
     display: np.ndarray,
     layout: list[dict],
-    is_recording: bool,
+    video_writer: cv2.VideoWriter | None,
     recording_path: Path | None,
     recording_started_at: datetime | None,
-    dropped_frames: int,
 ) -> None:
     wrist = None
     for item in layout:
@@ -169,13 +156,11 @@ def _draw_wrist_info_panel(
     color = (0, 255, 0)
     line_y = y0 + 24
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    status = "REC" if is_recording else "IDLE"
+    status = "REC" if video_writer is not None else "IDLE"
     lines = [f"Status: {status}", f"Time: {now_str}", f"Cameras: {len(layout)}"]
     if recording_started_at is not None:
         elapsed_s = int((datetime.now() - recording_started_at).total_seconds())
         lines.append(f"Elapsed: {elapsed_s}s")
-    if dropped_frames > 0:
-        lines.append(f"Dropped: {dropped_frames}")
     if recording_path is not None:
         lines.append(f"File: {recording_path.name}")
 
@@ -203,46 +188,17 @@ def _stop_cameras(cameras: list[dict]) -> None:
             pass
 
 
-def _start_video_writer(frame: np.ndarray, out_dir: Path, fps: int) -> tuple[cv2.VideoWriter, Path] | tuple[None, None]:
+def _start_video_writer(frame: np.ndarray, out_dir: Path, fps: int = 15) -> tuple[cv2.VideoWriter, Path] | tuple[None, None]:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = out_dir / f"teleop_recording_{timestamp}.avi"
+    out_path = out_dir / f"teleop_recording_{timestamp}.mp4"
 
     h, w = frame.shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*RECORD_CODEC)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
     if not writer.isOpened():
         return None, None
     return writer, out_path
-
-
-class _AsyncRecorder:
-    def __init__(self, writer: cv2.VideoWriter, max_queue: int = 120) -> None:
-        self.writer = writer
-        self.queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=max_queue)
-        self._stop = threading.Event()
-        self.dropped_frames = 0
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.is_set() or not self.queue.empty():
-            try:
-                frame = self.queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            self.writer.write(frame)
-
-    def write(self, frame: np.ndarray) -> None:
-        try:
-            self.queue.put_nowait(frame.copy())
-        except queue.Full:
-            self.dropped_frames += 1
-
-    def stop(self) -> None:
-        self._stop.set()
-        self.thread.join(timeout=3)
-        self.writer.release()
 
 
 def main() -> int:
@@ -260,11 +216,10 @@ def main() -> int:
     print("Starting gamepad teleop...")
     teleop_proc = subprocess.Popen([sys.executable, str(gamepad_demo)])
     recordings_dir = script_dir / "recordings"
-    recorder: _AsyncRecorder | None = None
+    video_writer: cv2.VideoWriter | None = None
     recording_path: Path | None = None
     recording_started_at: datetime | None = None
     last_saved_recording_path: Path | None = None
-    record_fps = min((cam["fps"] for cam in cameras), default=TARGET_CAMERA_FPS)
 
     try:
         print("Press 'q' to quit, 's' to save current frames, 'r' to start/stop video recording.")
@@ -284,11 +239,10 @@ def main() -> int:
             tiled, layout = _tile_frames(frames_for_window)
             if tiled is not None:
                 display = tiled.copy()
-                panel_path = recording_path if recorder is not None else last_saved_recording_path
-                dropped = recorder.dropped_frames if recorder is not None else 0
-                _draw_wrist_info_panel(display, layout, recorder is not None, panel_path, recording_started_at, dropped)
-                if recorder is not None:
-                    recorder.write(display)
+                panel_path = recording_path if video_writer is not None else last_saved_recording_path
+                _draw_wrist_info_panel(display, layout, video_writer, panel_path, recording_started_at)
+                if video_writer is not None:
+                    video_writer.write(display)
                 cv2.imshow("Stretch Cameras", display)
 
             key = cv2.waitKey(1) & 0xFF
@@ -296,22 +250,21 @@ def main() -> int:
                 print("Quitting...")
                 break
             if key == ord("r"):
-                if recorder is None:
+                if video_writer is None:
                     if tiled is None:
                         print("No frame available yet; cannot start recording.")
                     else:
-                        video_writer, recording_path = _start_video_writer(tiled, recordings_dir, fps=record_fps)
+                        video_writer, recording_path = _start_video_writer(tiled, recordings_dir)
                         if video_writer is None:
                             print("Failed to start recording (VideoWriter could not open).")
                         else:
-                            recorder = _AsyncRecorder(video_writer)
                             recording_started_at = datetime.now()
-                            print(f"Recording started ({record_fps} FPS): {recording_path}")
+                            print(f"Recording started: {recording_path}")
                 else:
-                    recorder.stop()
+                    video_writer.release()
                     print(f"Recording saved: {recording_path}")
                     last_saved_recording_path = recording_path
-                    recorder = None
+                    video_writer = None
                     recording_path = None
                     recording_started_at = None
             if key == ord("s"):
@@ -325,8 +278,8 @@ def main() -> int:
                     cam["save_idx"] += 1
 
     finally:
-        if recorder is not None:
-            recorder.stop()
+        if video_writer is not None:
+            video_writer.release()
             print(f"Recording saved: {recording_path}")
             last_saved_recording_path = recording_path
             recording_started_at = None
