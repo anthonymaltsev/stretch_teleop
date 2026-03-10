@@ -223,6 +223,8 @@ def main() -> int:
 
     try:
         print("Press 'q' to quit, 's' to save current frames, 'r' to start/stop video recording.")
+        cv2.namedWindow("Stretch Cameras", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("Stretch Cameras", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         while True:
             if teleop_proc.poll() is not None:
@@ -244,7 +246,6 @@ def main() -> int:
                 if video_writer is not None:
                     video_writer.write(display)
                 cv2.imshow("Stretch Cameras", display)
-                cv2.setWindowProperty("Stretch Cameras", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
