@@ -244,6 +244,7 @@ def main() -> int:
                 if video_writer is not None:
                     video_writer.write(display)
                 cv2.imshow("Stretch Cameras", display)
+                cv2.setWindowProperty("Stretch Cameras", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
