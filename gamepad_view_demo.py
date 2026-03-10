@@ -17,9 +17,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import tkinter as tk
+
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+
+
+def _get_screen_size() -> tuple[int, int]:
+    root = tk.Tk()
+    root.withdraw()
+    w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.destroy()
+    return w, h
 
 
 def _camera_label(device_name: str, index: int) -> str:
@@ -213,6 +223,8 @@ def main() -> int:
     if not cameras:
         print("No RealSense cameras found.")
 
+    screen_w, screen_h = _get_screen_size()
+
     print("Starting gamepad teleop...")
     teleop_proc = subprocess.Popen([sys.executable, str(gamepad_demo)])
     recordings_dir = script_dir / "recordings"
@@ -245,7 +257,7 @@ def main() -> int:
                 _draw_wrist_info_panel(display, layout, video_writer, panel_path, recording_started_at)
                 if video_writer is not None:
                     video_writer.write(display)
-                cv2.imshow("Stretch Cameras", display)
+                cv2.imshow("Stretch Cameras", cv2.resize(display, (screen_w, screen_h)))
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
